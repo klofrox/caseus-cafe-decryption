@@ -34,6 +34,27 @@ def _is_username(s: str) -> bool:
     return bool(USERNAME_RE.match(s))
 
 
+def _normalize_cafe_post_message(content: str) -> str:
+    text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\xa0", " ")
+
+    # Heuristic fix: some quoted messages arrive flattened as
+    # `> user> line1> line2reply text`.
+    if ">" in text and "\n" not in text:
+        text = re.sub(r"\s*>\s*", "\n> ", text).strip()
+        if text.startswith("> "):
+            text = text
+        elif text.startswith(">"):
+            text = "> " + text[1:].lstrip()
+
+        # Split glued `...10reply` tail after quoted line.
+        text = re.sub(r"(?<=\d)(?=[A-Za-zÇĞİÖŞÜçğıöşü])", "\n", text)
+
+    # Clean extra spaces per line while preserving blank lines.
+    lines = [ln.strip() if ln.strip() else "" for ln in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
 def extract_messages_from_topic_payload(payload: bytes):
     """Heuristic parser for Cafe topic payload -> list of (username, message).
 
@@ -120,6 +141,7 @@ def extract_posts_from_topic_payload(payload: bytes):
 
         author = types.String.unpack(buf, ctx=ctx)
         content = types.String.unpack(buf, ctx=ctx)
+        content = _normalize_cafe_post_message(content)
 
         liked = False
         if buf.tell() < len(payload):
@@ -195,6 +217,271 @@ def extract_posts_from_topic_payload(payload: bytes):
             break
 
     return posts
+
+
+def remove_posts_from_topic_payload(payload: bytes, banned_usernames) -> tuple[bytes, int] | None:
+    banned = {str(username).strip().casefold() for username in banned_usernames if str(username).strip()}
+    if not banned or len(payload) < 5:
+        return None
+
+    ctx = pak.Type.Context()
+    records = []
+    i = 5
+    resyncs = 0
+    max_posts = 256
+
+    while i < len(payload) and resyncs < len(payload) and max_posts > 0:
+        record_start = i
+        remaining = len(payload) - record_start
+        min_size = 2 + 4 + 4 + 4 + 2 + 2 + 1
+        if remaining < min_size:
+            break
+
+        buf = io.BytesIO(payload)
+        buf.seek(record_start)
+        try:
+            buf.read(2)
+            post_id = int.from_bytes(buf.read(4), "big")
+            buf.read(4)
+            buf.read(4)
+            author = types.String.unpack(buf, ctx=ctx)
+            content = types.String.unpack(buf, ctx=ctx)
+            if buf.tell() < len(payload):
+                buf.read(1)
+        except Exception:
+            resyncs += 1
+            i = record_start + 1
+            continue
+
+        record_end = buf.tell()
+        sane = (
+            post_id > 0
+            and _is_username(author)
+            and bool(str(content).strip("\x00 ").strip())
+            and len(author) < 64
+            and len(content) < 4096
+        )
+        if not sane:
+            resyncs += 1
+            i = record_start + 1
+            continue
+
+        records.append(
+            {
+                "start": record_start,
+                "end": record_end,
+                "banned": author.strip().casefold() in banned,
+            }
+        )
+
+        max_posts -= 1
+        i = record_end
+
+    remove_ranges = []
+    removed = 0
+    idx = 0
+    while idx < len(records):
+        if not records[idx]["banned"]:
+            idx += 1
+            continue
+
+        start = records[idx]["start"]
+        while idx < len(records) and records[idx]["banned"]:
+            removed += 1
+            idx += 1
+
+        if idx < len(records):
+            # Include the separator bytes between the removed record group and
+            # the next valid record. Leaving both adjacent separators makes the
+            # client parse the topic as empty.
+            end = records[idx]["start"]
+        else:
+            end = len(payload)
+
+        remove_ranges.append((start, end))
+
+    if not remove_ranges:
+        return None
+
+    rebuilt = bytearray()
+    cursor = 0
+    for start, end in remove_ranges:
+        rebuilt.extend(payload[cursor:start])
+        cursor = end
+    rebuilt.extend(payload[cursor:])
+
+    return bytes(rebuilt), removed
+
+
+def _same_length_string_bytes(value: str, length: int) -> bytes:
+    data = value.encode("utf-8", errors="ignore")[:length]
+    return data + (b" " * (length - len(data)))
+
+
+def mask_posts_from_topic_payload(
+    payload: bytes,
+    banned_usernames,
+    *,
+    author_replacement: str = "Hidden#0000",
+    message_replacement: str = "",
+) -> tuple[bytes, int] | None:
+    banned = {str(username).strip().casefold() for username in banned_usernames if str(username).strip()}
+    if not banned or len(payload) < 5:
+        return None
+
+    rewritten = bytearray(payload)
+    ctx = pak.Type.Context()
+    masked = 0
+    i = 5
+    resyncs = 0
+    max_posts = 256
+
+    while i < len(payload) and masked + resyncs < len(payload) and max_posts > 0:
+        record_start = i
+        remaining = len(payload) - record_start
+        min_size = 2 + 4 + 4 + 4 + 2 + 2 + 1
+        if remaining < min_size:
+            break
+
+        buf = io.BytesIO(payload)
+        buf.seek(record_start)
+        try:
+            buf.read(2)
+            post_id = int.from_bytes(buf.read(4), "big")
+            buf.read(4)
+            buf.read(4)
+
+            author_len_pos = buf.tell()
+            author = types.String.unpack(buf, ctx=ctx)
+            author_data_start = author_len_pos + 2
+            author_data_end = buf.tell()
+
+            content_len_pos = buf.tell()
+            content = types.String.unpack(buf, ctx=ctx)
+            content_data_start = content_len_pos + 2
+            content_data_end = buf.tell()
+
+            if buf.tell() < len(payload):
+                buf.read(1)
+        except Exception:
+            resyncs += 1
+            i = record_start + 1
+            continue
+
+        record_end = buf.tell()
+        sane = (
+            post_id > 0
+            and _is_username(author)
+            and bool(str(content).strip("\x00 ").strip())
+            and len(author) < 64
+            and len(content) < 4096
+        )
+        if not sane:
+            resyncs += 1
+            i = record_start + 1
+            continue
+
+        if author.strip().casefold() in banned:
+            author_length = author_data_end - author_data_start
+            content_length = content_data_end - content_data_start
+
+            rewritten[author_data_start:author_data_end] = _same_length_string_bytes(
+                author_replacement,
+                author_length,
+            )
+            rewritten[content_data_start:content_data_end] = _same_length_string_bytes(
+                message_replacement,
+                content_length,
+            )
+            masked += 1
+
+        max_posts -= 1
+        i = record_end
+
+    if masked <= 0:
+        return None
+
+    return bytes(rewritten), masked
+
+
+def rewrite_usernames_in_topic_payload(
+    payload: bytes,
+    target_username: str,
+    replacement_username: str,
+    replacement_global_id: int | None = None,
+) -> tuple[bytes, int] | None:
+    target_username = str(target_username or "").strip().casefold()
+    replacement_username = str(replacement_username or "").strip()
+    if not target_username or not replacement_username or len(payload) < 5:
+        return None
+
+    ctx = pak.Type.Context()
+    rebuilt = bytearray(payload[:5])
+    rewritten_count = 0
+    i = 5
+    resyncs = 0
+    max_posts = 256
+
+    while i < len(payload) and resyncs < len(payload) and max_posts > 0:
+        record_start = i
+        remaining = len(payload) - record_start
+        min_size = 2 + 4 + 4 + 4 + 2 + 2 + 1
+        if remaining < min_size:
+            rebuilt.extend(payload[record_start:])
+            break
+
+        buf = io.BytesIO(payload)
+        buf.seek(record_start)
+        try:
+            flags = buf.read(2)
+            post_id = buf.read(4)
+            timestamp = buf.read(4)
+            meta = buf.read(4)
+            author = types.String.unpack(buf, ctx=ctx)
+            content = types.String.unpack(buf, ctx=ctx)
+            liked = b""
+            if buf.tell() < len(payload):
+                liked = buf.read(1)
+        except Exception:
+            resyncs += 1
+            rebuilt.extend(payload[record_start:record_start + 1])
+            i = record_start + 1
+            continue
+
+        sane = (
+            int.from_bytes(post_id, "big") > 0
+            and _is_username(author)
+            and bool(str(content).strip("\x00 ").strip())
+            and len(author) < 64
+            and len(content) < 4096
+        )
+        if not sane:
+            resyncs += 1
+            rebuilt.extend(payload[record_start:record_start + 1])
+            i = record_start + 1
+            continue
+
+        if author.strip().casefold() == target_username:
+            author = replacement_username
+            if replacement_global_id is not None:
+                meta = int(replacement_global_id).to_bytes(4, "big", signed=False)
+            rewritten_count += 1
+
+        rebuilt.extend(flags)
+        rebuilt.extend(post_id)
+        rebuilt.extend(timestamp)
+        rebuilt.extend(meta)
+        rebuilt.extend(types.String.pack(author, ctx=ctx))
+        rebuilt.extend(types.String.pack(content, ctx=ctx))
+        rebuilt.extend(liked)
+
+        max_posts -= 1
+        i = buf.tell()
+
+    if rewritten_count <= 0:
+        return None
+
+    return bytes(rebuilt), rewritten_count
 
 
 
